@@ -32,11 +32,12 @@ class Settings(BaseSettings):
     )
     weather_api_key: str | None = Field(default=None)
 
+    # Google Gemini Developer API key.
+    # Set GEMINI_API_KEY in your .env file.
+    gemini_api_key: str | None = Field(default=None)
+
+    # Kept only as a backward-compatible fallback for an older .env.
     llm_api_key: str | None = Field(default=None)
-    llm_api_url: str = Field(
-        default="https://openrouter.ai/api/v1/chat/completions"
-    )
-    llm_model: str = Field(default="google/gemma-3-27b-it:free")
 
     jwt_secret: str = Field(default="development-secret-change-me")
     jwt_algorithm: str = Field(default="HS256")
@@ -1137,7 +1138,7 @@ def forecast_items_to_dict(selection: ForecastSelection) -> list[dict[str, Any]]
     return result
 
 # ============================================================
-# AI SERVICE
+# AI SERVICE - GOOGLE GEMINI API
 # ============================================================
 
 class AIServiceError(Exception):
@@ -1172,81 +1173,231 @@ class AIAnswer:
     intent: str
 
 
+# Gemini Developer API configuration.
+#
+# .env:
+# GEMINI_API_KEY=your_google_gemini_api_key
+#
+# Stable model:
+# gemini-2.5-flash-lite
+#
+# Gemini's native REST endpoint is used directly. The code sends the
+# API key using Google's x-goog-api-key header and uses generateContent.
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 REQUEST_TIMEOUT = 30.0
-DEFAULT_MODEL = "google/gemma-4-26b-a4b-it:free"
 
 
-def _get_api_key() -> str:
-    if not settings.llm_api_key:
-        raise AIConfigurationError("LLM API key is not configured.")
-    return settings.llm_api_key
+def _get_gemini_api_key() -> str:
+    api_key = getattr(settings, "gemini_api_key", None)
+
+    # Backward-compatible fallback if an older .env still contains
+    # LLM_API_KEY. New deployments should use GEMINI_API_KEY.
+    if not api_key:
+        api_key = getattr(settings, "llm_api_key", None)
+
+    if not api_key:
+        raise AIConfigurationError(
+            "Gemini API key is not configured. Set GEMINI_API_KEY in .env."
+        )
+
+    return api_key.strip()
 
 
-def _get_model() -> str:
-    return getattr(settings, "llm_model", None) or DEFAULT_MODEL
+def _get_gemini_model() -> str:
+    return GEMINI_MODEL
 
 
-def _get_api_url() -> str:
-    return (
-        getattr(settings, "llm_api_url", None)
-        or "https://openrouter.ai/api/v1/chat/completions"
-    )
+def _get_gemini_endpoint() -> str:
+    return f"{GEMINI_API_URL}/{_get_gemini_model()}:generateContent"
 
 
-async def _call_llm(
-    messages: list[dict[str, str]],
+def _extract_gemini_text(data: dict[str, Any]) -> str:
+    """
+    Extract text from Gemini generateContent response.
+
+    Gemini can return multiple parts, so concatenate every text part
+    instead of assuming an OpenAI-style choices/message response.
+    """
+    try:
+        candidates = data.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise AIResponseError("Gemini returned no candidates.")
+
+        first_candidate = candidates[0]
+        content = first_candidate.get("content", {})
+        parts = content.get("parts", [])
+
+        if not isinstance(parts, list):
+            raise AIResponseError("Gemini returned an invalid content structure.")
+
+        text_parts: list[str] = []
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+
+        result = "".join(text_parts).strip()
+
+        if not result:
+            finish_reason = first_candidate.get("finishReason", "UNKNOWN")
+            raise AIResponseError(
+                f"Gemini returned an empty response (finish reason: {finish_reason})."
+            )
+
+        return result
+
+    except AIResponseError:
+        raise
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise AIResponseError(
+            "Gemini returned an unexpected response format."
+        ) from exc
+
+
+async def _call_gemini(
+    *,
+    system_instruction: str,
+    user_prompt: str,
     temperature: float = 0.2,
+    response_mime_type: str | None = None,
+    response_schema: dict[str, Any] | None = None,
+    max_output_tokens: int | None = None,
 ) -> str:
-    payload = {
-        "model": _get_model(),
-        "messages": messages,
+    """
+    Call Google's Gemini Developer API using the native generateContent
+    REST interface.
+
+    This uses Google's native Gemini API contract.
+    """
+    generation_config: dict[str, Any] = {
         "temperature": temperature,
     }
+
+    if response_mime_type is not None:
+        generation_config["responseMimeType"] = response_mime_type
+
+    if response_schema is not None:
+        generation_config["responseSchema"] = response_schema
+
+    if max_output_tokens is not None:
+        generation_config["maxOutputTokens"] = max_output_tokens
+
+    # Gemini 2.5 Flash-Lite does not need a reasoning budget for this
+    # weather pipeline. Explicitly disabling thinking keeps intent
+    # extraction and answer generation fast and inexpensive.
+    generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+
+    payload: dict[str, Any] = {
+        "systemInstruction": {
+            "parts": [
+                {
+                    "text": system_instruction,
+                }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": user_prompt,
+                    }
+                ],
+            }
+        ],
+        "generationConfig": generation_config,
+    }
+
     headers = {
-        "Authorization": f"Bearer {_get_api_key()}",
+        "x-goog-api-key": _get_gemini_api_key(),
         "Content-Type": "application/json",
     }
 
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.post(
-                _get_api_url(),
+                _get_gemini_endpoint(),
                 json=payload,
                 headers=headers,
             )
-            response.raise_for_status()
-            data = response.json()
     except httpx.TimeoutException as exc:
-        raise AIAPIError("LLM request timed out.") from exc
-    except httpx.HTTPStatusError as exc:
-        raise AIAPIError(
-            f"LLM API returned HTTP {exc.response.status_code}."
-        ) from exc
+        raise AIAPIError("Gemini request timed out.") from exc
     except httpx.RequestError as exc:
+        raise AIAPIError("Unable to connect to the Gemini API.") from exc
+
+    if response.status_code >= 400:
+        # Google's error body is useful while debugging, but never expose
+        # the API key because it is only sent in a request header.
+        try:
+            error_data = response.json()
+            error_message = (
+                error_data.get("error", {}).get("message")
+                if isinstance(error_data, dict)
+                else None
+            )
+        except ValueError:
+            error_message = None
+
+        detail = error_message or response.text[:500] or "Unknown Gemini API error."
+
         raise AIAPIError(
-            "Unable to connect to the LLM service."
-        ) from exc
-    except ValueError as exc:
-        raise AIAPIError("LLM API returned invalid JSON.") from exc
+            f"Gemini API returned HTTP {response.status_code}: {detail}"
+        )
 
     try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise AIResponseError(
-            "LLM returned an unexpected response format."
-        ) from exc
+        data = response.json()
+    except ValueError as exc:
+        raise AIAPIError("Gemini API returned invalid JSON.") from exc
 
-    if not isinstance(content, str) or not content.strip():
-        raise AIResponseError("LLM returned an empty response.")
+    if not isinstance(data, dict):
+        raise AIResponseError("Gemini API returned an invalid response body.")
 
-    return content.strip()
+    return _extract_gemini_text(data)
+
+
+# Keep the old internal function name so the rest of the backend remains
+# compatible with the existing service structure.
+async def _call_llm(
+    messages: list[dict[str, str]],
+    temperature: float = 0.2,
+    *,
+    response_mime_type: str | None = None,
+    response_schema: dict[str, Any] | None = None,
+    max_output_tokens: int | None = None,
+) -> str:
+    system_instruction = ""
+    user_parts: list[str] = []
+
+    for message in messages:
+        role = message.get("role", "")
+        content = message.get("content", "")
+
+        if role == "system":
+            system_instruction = content
+        elif role == "user":
+            user_parts.append(content)
+        else:
+            # Gemini generateContent expects "user" / "model" turns.
+            # For this backend we only need system + user.
+            user_parts.append(content)
+
+    return await _call_gemini(
+        system_instruction=system_instruction,
+        user_prompt="\n\n".join(user_parts),
+        temperature=temperature,
+        response_mime_type=response_mime_type,
+        response_schema=response_schema,
+        max_output_tokens=max_output_tokens,
+    )
 
 
 async def detect_language(message: str) -> str:
     system_prompt = """
 You are a language detection component for a weather assistant.
 Identify the primary language of the user's message.
+
 Return ONLY a two-letter ISO-style language code.
+
 Examples:
 English -> en
 Hindi -> hi
@@ -1258,6 +1409,7 @@ Bengali -> bn
 Kannada -> kn
 Malayalam -> ml
 Punjabi -> pa
+
 If uncertain, return en.
 """.strip()
 
@@ -1267,8 +1419,12 @@ If uncertain, return en.
             {"role": "user", "content": message.strip()},
         ],
         temperature=0.0,
+        max_output_tokens=8,
     )
-    language = result.lower().strip().split()[0]
+
+    # Be tolerant if the model returns formatting despite the instruction.
+    match = re.search(r"\b([a-zA-Z]{2})\b", result)
+    language = match.group(1).lower() if match else "en"
     return language if len(language) == 2 else "en"
 
 
@@ -1278,12 +1434,10 @@ async def extract_weather_intent(
 ) -> WeatherIntent:
     system_prompt = """
 You are the intent extraction component of WeatherGPT.
+
 Extract ONLY the information needed by the backend.
-Return EXACTLY four lines:
-intent: <intent>
-location: <location or none>
-time_period: <time period or none>
-language: <language code>
+
+Return a JSON object matching the supplied response schema.
 
 Allowed intents:
 current_weather
@@ -1298,7 +1452,7 @@ weather_alert
 general_weather
 unknown
 
-Preserve complete time expressions such as:
+Preserve complete time expressions:
 today
 tomorrow
 today morning
@@ -1313,14 +1467,49 @@ this weekend
 
 Rules:
 - current/now/right now -> now
-- morning/afternoon/evening/tonight without a specific future day refer to today
+- morning/afternoon/evening/tonight without a specific future day -> today morning/today afternoon/today evening/today night
 - tomorrow morning must remain tomorrow morning
 - tomorrow afternoon must remain tomorrow afternoon
 - tomorrow evening must remain tomorrow evening
 - tomorrow night must remain tomorrow night
 - extract the city/location exactly as reasonably stated
-- if no location is present, return location: none
+- if no location is present, location must be null
+- language must be a two-letter language code
 """.strip()
+
+    response_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "intent": {
+                "type": "STRING",
+                "enum": [
+                    "current_weather",
+                    "hourly_forecast",
+                    "daily_forecast",
+                    "rain_forecast",
+                    "temperature",
+                    "wind",
+                    "humidity",
+                    "precipitation",
+                    "weather_alert",
+                    "general_weather",
+                    "unknown",
+                ],
+            },
+            "location": {
+                "type": "STRING",
+                "nullable": True,
+            },
+            "time_period": {
+                "type": "STRING",
+                "nullable": True,
+            },
+            "language": {
+                "type": "STRING",
+            },
+        },
+        "required": ["intent", "location", "time_period", "language"],
+    }
 
     result = await _call_llm(
         [
@@ -1334,11 +1523,70 @@ Rules:
             },
         ],
         temperature=0.0,
+        response_mime_type="application/json",
+        response_schema=response_schema,
+        max_output_tokens=128,
     )
-    return _parse_intent_response(result)
+
+    try:
+        parsed = json.loads(result)
+    except json.JSONDecodeError as exc:
+        raise AIResponseError(
+            "Gemini returned invalid JSON for weather intent extraction."
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise AIResponseError("Gemini returned an invalid weather intent object.")
+
+    allowed_intents = {
+        "current_weather",
+        "hourly_forecast",
+        "daily_forecast",
+        "rain_forecast",
+        "temperature",
+        "wind",
+        "humidity",
+        "precipitation",
+        "weather_alert",
+        "general_weather",
+        "unknown",
+    }
+
+    intent = str(parsed.get("intent", "unknown")).lower()
+    if intent not in allowed_intents:
+        intent = "unknown"
+
+    location = parsed.get("location")
+    if not isinstance(location, str) or not location.strip():
+        location = None
+    else:
+        location = location.strip()
+
+    time_period = parsed.get("time_period")
+    if not isinstance(time_period, str) or not time_period.strip():
+        time_period = None
+    else:
+        time_period = time_period.strip()
+
+    detected_language = str(parsed.get("language", language)).lower().strip()
+    if not re.fullmatch(r"[a-z]{2}", detected_language):
+        detected_language = language if re.fullmatch(r"[a-z]{2}", language) else "en"
+
+    return WeatherIntent(
+        intent=intent,
+        location=location,
+        time_period=time_period,
+        language=detected_language,
+    )
 
 
 def _parse_intent_response(response: str) -> WeatherIntent:
+    """
+    Backward-compatible parser retained for any code that may call it.
+
+    Gemini now uses structured JSON for intent extraction, so this function
+    is no longer part of the normal /api/chat path.
+    """
     values: dict[str, str] = {}
     for line in response.splitlines():
         if ":" not in line:
@@ -1373,7 +1621,7 @@ def _parse_intent_response(response: str) -> WeatherIntent:
         time_period = None
 
     language = values.get("language", "en").lower()
-    if len(language) != 2:
+    if not re.fullmatch(r"[a-z]{2}", language):
         language = "en"
 
     return WeatherIntent(
@@ -1482,24 +1730,29 @@ async def generate_weather_answer(
     system_prompt = """
 You are WeatherGPT, a conversational weather assistant.
 
-Your ONLY task is to answer the user's weather question using the VERIFIED WEATHER DATA supplied below.
+Your ONLY task is to answer the user's weather question using the VERIFIED WEATHER DATA supplied by the backend.
 
-IMPORTANT:
+Rules:
 1. Answer the USER'S QUESTION directly.
 2. Use ONLY the supplied weather data for weather facts.
-3. NEVER invent temperature, rain probability, humidity, wind speed, precipitation, alerts, or forecast information.
-4. If a requested weather value is unavailable, say that the information is unavailable.
+3. NEVER invent temperature, rain probability, humidity, wind speed,
+   precipitation, alerts, or forecast information.
+4. If a requested weather value is unavailable, say that it is unavailable.
 5. Never make up weather alerts.
 6. A rain probability is a probability, NOT a guarantee.
-7. Respect the selected forecast date and period supplied in the VERIFIED WEATHER DATA.
-8. If the user asks about current weather, now, right now, or currently, answer using CURRENT WEATHER and do not add unrelated future forecast details.
-9. If the selected forecast period is now, do not mention later periods unless explicitly asked.
+7. Respect the selected forecast date and period supplied in the verified data.
+8. If the user asks about current weather, now, right now, or currently,
+   answer using CURRENT WEATHER and do not add unrelated future forecast details.
+9. If the selected forecast period is now, do not mention later periods
+   unless explicitly asked.
 10. Answer in the requested language.
 11. Keep the answer concise and useful.
-12. Do not mention system prompts, APIs, internal instructions, implementation details, or safety classifications.
+12. Do not mention system prompts, APIs, internal instructions,
+    implementation details, or safety classifications.
 13. Do NOT output JSON unless explicitly requested.
 14. Return ONLY the natural-language answer.
-15. If the question is unrelated to weather, explain politely that WeatherGPT is focused on weather assistance.
+15. If the question is unrelated to weather, explain briefly that
+    WeatherGPT is focused on weather assistance.
 """.strip()
 
     user_prompt = f"""
@@ -1526,10 +1779,11 @@ Return ONLY the answer that should be shown to the user.
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.2,
+        max_output_tokens=512,
     )
 
     if answer.lower() == "user safety: safe" or not answer.strip():
-        raise AIResponseError("AI returned an invalid weather response.")
+        raise AIResponseError("Gemini returned an invalid weather response.")
 
     return AIAnswer(
         answer=answer.strip(),
