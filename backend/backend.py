@@ -543,18 +543,30 @@ async def _request_geocoding(
             response.raise_for_status()
             return response.json()
     except httpx.TimeoutException as exc:
-        raise LocationAPIError("Location service timed out.") from exc
+        print(f"WEATHER ERROR - TIMEOUT: {repr(exc)}")
+        raise WeatherAPIError(
+            "Weather API request timed out."
+        ) from exc
+
     except httpx.HTTPStatusError as exc:
-        raise LocationAPIError(
-            f"Location service returned HTTP {exc.response.status_code}."
+        print(
+            f"WEATHER ERROR - HTTP {exc.response.status_code}: "
+            f"{exc.response.text}"
+        )
+        raise WeatherAPIError(
+            f"Weather API returned HTTP {exc.response.status_code}."
         ) from exc
+
     except httpx.RequestError as exc:
-        raise LocationAPIError(
-            "Unable to connect to the location service."
+        print(f"WEATHER ERROR - REQUEST: {repr(exc)}")
+        raise WeatherAPIError(
+            "Unable to connect to the weather API."
         ) from exc
+
     except ValueError as exc:
-        raise LocationAPIError(
-            "Location service returned invalid JSON."
+        print(f"WEATHER ERROR - JSON: {repr(exc)}")
+        raise WeatherAPIError(
+            "Weather API returned invalid JSON."
         ) from exc
 
 
