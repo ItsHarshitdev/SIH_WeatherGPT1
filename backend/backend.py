@@ -654,16 +654,26 @@ async def get_weather(
             response.raise_for_status()
             data = response.json()
     except httpx.TimeoutException as exc:
+        print(f"WEATHER ERROR - TIMEOUT: {exc}")
         raise WeatherAPIError("Weather service timed out.") from exc
+
     except httpx.HTTPStatusError as exc:
+        print(
+            f"WEATHER ERROR - HTTP {exc.response.status_code}: "
+            f"{exc.response.text}"
+        )
         raise WeatherAPIError(
             f"Weather service returned HTTP {exc.response.status_code}."
         ) from exc
+
     except httpx.RequestError as exc:
+        print(f"WEATHER ERROR - REQUEST: {repr(exc)}")
         raise WeatherAPIError(
             "Unable to connect to the weather service."
         ) from exc
+
     except ValueError as exc:
+        print(f"WEATHER ERROR - JSON: {repr(exc)}")
         raise WeatherAPIError(
             "Weather service returned invalid JSON."
         ) from exc
@@ -1657,7 +1667,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
