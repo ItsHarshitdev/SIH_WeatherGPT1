@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+pwdlib[argon2]
+pyjwt
+httpx
+email-validator
