@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     llm_api_url: str = Field(
         default="https://openrouter.ai/api/v1/chat/completions"
     )
-    llm_model: str = Field(default="gpt-4o-mini")
+    llm_model: str = Field(default="google/gemma-3-27b-it:free")
 
     jwt_secret: str = Field(default="development-secret-change-me")
     jwt_algorithm: str = Field(default="HS256")
